@@ -1,0 +1,11 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="NetworkCtl/NetworkCtl.vcxproj" Id="03c54c12-103e-4671-8d9a-1fdb844e47f1" />
+  <Project Path="NetworkDriver.vcxproj">
+    <Deploy />
+  </Project>
+  <Project Path="Tests/NetworkDriverTests.vcxproj" />
+</Solution>

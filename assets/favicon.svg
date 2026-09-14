@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <title>Windows Packet Filter</title>
+  <rect x="1" y="1" width="62" height="62" rx="13" fill="#090f1c" stroke="#365166" stroke-width="2"/>
+  <path d="M19 17H12V47H19M45 17H52V47H45" stroke="#5be2f2" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M22 25H41M22 32H36M22 39H30" stroke="#5be2f2" stroke-width="3" stroke-linecap="round"/>
+</svg>

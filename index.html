@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A C11 Windows WFP callout driver, explained: IPv4 TCP/UDP connection monitoring, endpoint blocking, secure IOCTLs, and a deliberate kernel/user boundary.">
+  <meta name="theme-color" content="#090f1c">
+  <meta property="og:title" content="Windows Packet Filter — Connection filtering, explained">
+  <meta property="og:description" content="Inside a C11 Windows driver: WFP callouts, a secure control plane, bounded event logging, and honest validation boundaries.">
+  <meta property="og:type" content="website">
+  <title>Windows Packet Filter — Design, implementation, and connection decisions</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to project write-up</a>
+  <header class="site-header wrap">
+    <a class="brand" href="index.html" aria-label="Windows Packet Filter home"><span class="brand-mark" aria-hidden="true">[pf]</span> packet<span class="brand-suffix"> / WINDOWS</span></a>
+    <nav aria-label="Main navigation">
+      <a href="#architecture">How it works</a>
+      <a href="#decisions">Rule examples</a>
+      <a href="#run">Run it yourself</a>
+      <a href="https://github.com/hichauhan-in/windows-packet-filter-driver">Source <span aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="hero-grid">
+        <div>
+          <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> Implementation notes / C11 and Windows kernel</p>
+          <h1 id="hero-title">A small Windows<br>packet filter,<br><span>explained.</span></h1>
+          <p class="intro">A WFP callout driver that observes IPv4 TCP/UDP connection attempts and blocks selected endpoints. A C controller configures the rule and reads metadata across a secured user/kernel boundary.</p>
+          <div class="hero-actions">
+            <a class="button primary" href="#overview">Read the design <span aria-hidden="true">↓</span></a>
+            <a class="button secondary" href="#decisions">Follow a decision</a>
+          </div>
+          <p class="disclaimer">Connection authorization, not raw packet capture.<br>Educational implementation. Kernel VM validation still pending.</p>
+        </div>
+        <aside class="hero-console" aria-labelledby="console-title">
+          <div class="terminal-head"><span class="terminal-dots" aria-hidden="true">● ● ●</span><span id="console-title">rule walkthrough</span><span class="terminal-tag">ILLUSTRATION</span></div>
+          <div class="terminal-body">
+            <p class="terminal-label">One narrow rule</p>
+            <pre class="terminal-command"><code><span class="prompt" aria-hidden="true">&gt; </span>NetworkCtl block out tcp 127.0.0.1 8080</code></pre>
+            <div class="pipeline" aria-label="Decision flow: connection, WFP authorization, rule check"><span>CONNECT</span><i aria-hidden="true">→</i><span>WFP / ALE</span><i aria-hidden="true">→</i><span>RULE</span></div>
+            <dl class="terminal-stats">
+              <div><dt>Remote endpoint</dt><dd>127.0.0.1:8080</dd></div>
+              <div><dt>Direction / protocol</dt><dd>outbound / TCP</dd></div>
+              <div><dt>If action-write is available</dt><dd class="block-text">BLOCK</dd></div>
+              <div><dt>A nonmatching connection</dt><dd class="continue-text">CONTINUE</dd></div>
+            </dl>
+            <p class="terminal-caption">A worked example, not a driver capture. CONTINUE leaves the final decision to the remaining WFP policy.</p>
+            <div class="terminal-foot"><span class="status-dot" aria-hidden="true"></span> Understand the boundary. Preserve the contract.</div>
+          </div>
+        </aside>
+      </div>
+      <div class="feature-strip" aria-label="Implementation at a glance">
+        <span><strong>02</strong> IPv4 ALE layers</span><span><strong>04</strong> TCP/UDP filters</span><span><strong>128</strong> bounded event slots</span><span><strong>01</strong> volatile block rule</span>
+      </div>
+    </section>
+
+    <nav class="article-index wrap" aria-label="Technical write-up sections">
+      <span class="eyebrow">On this page</span>
+      <a href="#overview">Problem</a><a href="#architecture">Architecture</a><a href="#lifecycle">Lifecycle</a><a href="#decisions">Decisions</a><a href="#monitoring">Monitoring</a><a href="#security">Permissions</a><a href="#tradeoffs">Tradeoffs</a><a href="#validation">Validation</a><a href="#run">Build &amp; run</a><a href="#limits">Limits</a><a href="#source-map">Source map</a>
+    </nav>
+
+    <section class="writeup wrap" id="overview" aria-labelledby="overview-title">
+      <p class="eyebrow">01 / The problem</p>
+      <h2 id="overview-title">Observe a connection.<br>Make one deliberate decision.</h2>
+      <div class="prose">
+        <p>A network application asks Windows to communicate with an endpoint. Where can a driver observe that request, reject a specific destination, and still cooperate with the rest of the firewall? This project explores that boundary using <strong>Windows Filtering Platform (WFP)</strong>, the operating system’s network-filtering infrastructure.</p>
+        <p>The useful outcome is not a replacement for Windows Firewall. It is an implementation of the contracts behind a filter: registering callbacks, extracting typed metadata, handling concurrent requests, validating a control interface, and cleaning up every object the driver creates.</p>
+      </div>
+      <div class="callout">
+        <span class="callout-label">What “packet filter” means here</span>
+        <p>The driver works at the <strong>Application Layer Enforcement (ALE)</strong> authorization layers. It evaluates connection authorizations, not every packet. It does not inspect Ethernet frames, parse TCP payloads, decrypt traffic, or produce a PCAP file.</p>
+      </div>
+      <ol class="flow-track" aria-label="High-level connection flow">
+        <li><span class="flow-number">01</span><strong>Application request</strong><span>A fresh TCP connection or UDP endpoint authorization</span></li>
+        <li><span class="flow-number">02</span><strong>Windows filtering</strong><span>WFP invokes a registered ALE callout</span></li>
+        <li><span class="flow-number">03</span><strong>Driver decision</strong><span>Compare the endpoint against the current rule</span></li>
+        <li><span class="flow-number">04</span><strong>Policy arbitration</strong><span>Block a match, or continue through other WFP policy</span></li>
+      </ol>
+    </section>
+
+    <section class="writeup wrap" id="architecture" aria-labelledby="architecture-title">
+      <p class="eyebrow">02 / Architecture</p>
+      <h2 id="architecture-title">Separate the control plane<br>from the classification path.</h2>
+      <div class="architecture panel" aria-label="User-mode controller and tests separated from the kernel driver and WFP">
+        <div class="architecture-row">
+          <p class="lane-label">USER MODE</p>
+          <div class="architecture-node"><span class="number">CONTROL</span><h3>NetworkCtl.exe</h3><p>Validate arguments, open the device, send a rule, read stats or events.</p></div>
+          <div class="architecture-node"><span class="number">TEST</span><h3>NetworkDriverTests.exe</h3><p>Exercise shared policy functions and create repeatable TCP/UDP echo traffic.</p></div>
+        </div>
+        <div class="boundary"><span>DeviceIoControl</span><span class="boundary-rule" aria-hidden="true"></span><strong>secured user / kernel boundary</strong><span class="boundary-rule" aria-hidden="true"></span><span>METHOD_BUFFERED</span></div>
+        <div class="architecture-row">
+          <p class="lane-label">KERNEL MODE</p>
+          <div class="architecture-node kernel-node"><span class="number">CONTROL ENDPOINT</span><h3>NetworkDriver.sys</h3><p>Versioned IOCTLs update one rule and drain a bounded metadata ring under a spin lock.</p></div>
+          <div class="architecture-node kernel-node"><span class="number">CLASSIFICATION</span><h3>WFP → NdClassify</h3><p>Two ALE callouts receive typed endpoints, check action rights, evaluate policy, and record a decision.</p></div>
+        </div>
+        <p class="diagram-caption">Network traffic does not pass through the controller. WFP invokes the driver independently; IOCTLs carry only control data and recorded metadata.</p>
+      </div>
+      <div class="cards three-columns">
+        <article><span class="number">WDM / LIFETIME</span><h3>A control driver, not a NIC driver</h3><p>WDM provides entry, dispatch, device creation and unload routines. There is no NDIS lightweight-filter attachment to a network adapter.</p></article>
+        <article><span class="number">WFP / POLICY</span><h3>Runtime and management objects</h3><p>The runtime callout holds callback pointers. A management callout associates its GUID with a layer. Filters make WFP invoke that callout for TCP and UDP.</p></article>
+        <article><span class="number">SHARED / CONTRACT</span><h3>One header, two trust levels</h3><p>The driver and controller compile the same pointer-free structures. Version, size, reserved fields and access bits define what crosses the boundary.</p></article>
+      </div>
+      <div class="layer-grid">
+        <div class="panel"><span class="direction-label">OUTBOUND</span><h3>Authorize a connection</h3><code class="long-code">FWPM_LAYER_ALE_AUTH_CONNECT_V4</code><p>The service port is the <strong>remote port</strong>: the service the local application wants to reach.</p></div>
+        <div class="panel"><span class="direction-label">INBOUND</span><h3>Authorize a receive / accept</h3><code class="long-code">FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4</code><p>The service port is the <strong>local port</strong>: the service listening on this machine.</p></div>
+      </div>
+    </section>
+
+    <section class="writeup wrap" id="lifecycle" aria-labelledby="lifecycle-title">
+      <p class="eyebrow">03 / Driver lifecycle</p>
+      <h2 id="lifecycle-title">Registration is only half the job.</h2>
+      <div class="lifecycle-grid">
+        <div>
+          <p class="prose">Initialization starts in monitor-only mode. WFP management changes are transactional, and the session is dynamic: its policy objects belong to the engine handle rather than becoming persistent machine policy.</p>
+          <ol class="step-list">
+            <li><strong>Initialize state.</strong><span>Set the versioned default rule, counters and spin lock. No enabled block rule survives a reload.</span></li>
+            <li><strong>Create the secure endpoint.</strong><span>Use IoCreateDeviceSecure for a named control device with a protected DACL.</span></li>
+            <li><strong>Register policy atomically.</strong><span>Open the BFE engine, begin a transaction, add the private sublayer, two callouts and four protocol filters, then commit.</span></li>
+            <li><strong>Expose the controller link.</strong><span>Publish the DOS symbolic link only after initialization succeeds.</span></li>
+          </ol>
+        </div>
+        <aside class="panel cleanup-panel">
+          <span class="number">REVERSE THE LIFETIME</span><h3>Failure and unload use the same cleanup path.</h3>
+          <ol class="cleanup-list"><li>Remove the symbolic link.</li><li>Close the dynamic engine session to remove its policy.</li><li>Unregister runtime callouts and wait for in-flight callbacks.</li><li>Delete the control device.</li></ol>
+          <p class="muted">No retained flow contexts, deferred work, or pending IRPs are designed into this sample. Existing user handles must be closed before unloading.</p>
+          <p class="note">BFE is the <strong>Base Filtering Engine</strong>, Windows’ service for managing filtering policy. It must be available; if its session is lost, this sample requires a driver restart.</p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="workspace" id="decisions" aria-labelledby="decisions-title">
+      <div class="wrap">
+        <div class="section-heading"><div><p class="eyebrow">04 / Follow a rule</p><h2 id="decisions-title">Same endpoint. Different contracts.</h2></div><span class="badge">WORKED EXAMPLES / NOT LIVE</span></div>
+        <p class="prose">A rule is a conjunction: direction <strong>and</strong> protocol <strong>and</strong> remote IPv4 <strong>and</strong> service port must match, except fields marked <code>any</code>. At least an IP or port is required. Expand a case to trace the reasoning.</p>
+        <div class="rule-summary panel"><span class="number">EXAMPLE OUTBOUND RULE</span><code>NetworkCtl block out tcp 127.0.0.1 8080</code><p class="muted">These cases illustrate the implemented policy. This page neither loads the C driver nor receives network events.</p></div>
+        <div class="decision-list">
+          <details open>
+            <summary><span class="case-number">A</span><span>Matching outbound connection</span><span class="decision block">BLOCK</span></summary>
+            <div class="decision-content"><dl class="endpoint"><div><dt>Local</dt><dd>127.0.0.1:50000</dd></div><div><dt>Remote</dt><dd>127.0.0.1:8080</dd></div><div><dt>Protocol / direction</dt><dd>TCP / outbound</dd></div></dl><p>All four rule fields match. If WFP grants <code>FWPS_RIGHT_ACTION_WRITE</code>, the driver returns <code>FWP_ACTION_BLOCK</code> and clears the action-write right. The event ring records this callout’s block decision.</p></div>
+          </details>
+          <details>
+            <summary><span class="case-number">B</span><span>Same IP, different service port</span><span class="decision continue">CONTINUE</span></summary>
+            <div class="decision-content"><dl class="endpoint"><div><dt>Local</dt><dd>127.0.0.1:50000</dd></div><div><dt>Remote</dt><dd>127.0.0.1:8081</dd></div><div><dt>Protocol / direction</dt><dd>TCP / outbound</dd></div></dl><p>Port 8081 does not match 8080, so this driver does not block. With action-write available it returns <code>FWP_ACTION_CONTINUE</code>, not a blanket permit. Windows Firewall or another provider can still reject the connection. UDP to 8080 would also miss this TCP-only rule.</p></div>
+          </details>
+          <details>
+            <summary><span class="case-number">C</span><span>Inbound: service means the local port</span><span class="decision block">BLOCK</span></summary>
+            <div class="decision-content"><p class="example-rule"><strong>Different rule for this case:</strong> <code>NetworkCtl block in tcp 192.0.2.10 8080</code></p><dl class="endpoint"><div><dt>Local</dt><dd>192.0.2.20:8080</dd></div><div><dt>Remote</dt><dd>192.0.2.10:50000</dd></div><div><dt>Protocol / direction</dt><dd>TCP / inbound</dd></div></dl><p>The remote address matches the peer, while service port 8080 matches the <em>local</em> listener. The peer’s ephemeral port 50000 is not the service port. With action-write available, this matches and blocks. These addresses are reserved documentation examples, not public test targets.</p></div>
+          </details>
+          <details>
+            <summary><span class="case-number">D</span><span>The callout cannot write the action</span><span class="decision no-right">NO-RIGHT</span></summary>
+            <div class="decision-content"><p>Even if every rule field matches, the driver must not overwrite a decision when <code>FWPS_RIGHT_ACTION_WRITE</code> is absent. It leaves the classification output untouched and records <code>ND_ACTION_NO_RIGHT</code>. This label describes the callback’s authority, not a final allow or block result.</p></div>
+          </details>
+          <details>
+            <summary><span class="case-number">E</span><span>Restore monitor-only mode</span><span class="decision continue">CONTINUE*</span></summary>
+            <div class="decision-content"><p><code>NetworkCtl monitor</code> replaces the rule with a disabled one. Subsequent authorizations are observed without blocking by this driver. <strong>*Action-write still matters:</strong> if it is absent, the existing action is preserved and the event is NO-RIGHT instead.</p><p>Closing the controller or pressing Ctrl+C in a watcher does <strong>not</strong> clear an enabled rule. Use <code>monitor</code> or unload the driver.</p></div>
+          </details>
+        </div>
+        <p class="muted">Rule changes affect future authorization callbacks. They do not explicitly request reauthorization or disconnect existing sockets; use fresh sockets when testing.</p>
+      </div>
+    </section>
+
+    <section class="writeup wrap" id="monitoring" aria-labelledby="monitoring-title">
+      <p class="eyebrow">05 / Observable state</p><h2 id="monitoring-title">Metadata in. Bounded records out.</h2>
+      <div class="prose"><p>The classify callback can run at <code>DISPATCH_LEVEL</code>, concurrently on multiple CPUs. Its path uses nonpaged static storage and a short spin-lock critical section. It does not allocate memory, wait on user mode, write files, or print a log line for every event.</p></div>
+      <div class="ring-panel panel">
+        <div class="section-heading"><h3>Oldest → newest</h3><span class="mono muted">128 slots / fixed capacity</span></div>
+        <div class="ring-illustration" aria-label="Conceptual event ring: oldest queued records are overwritten when full"><span class="ring-old">oldest</span><span>event</span><span>event</span><span aria-label="intermediate slots">···</span><span>event</span><span class="ring-new">newest</span></div>
+        <p>When full, the ring overwrites the oldest event and increments <code>Overwritten</code>. Each read drains up to <strong>32 records</strong>. Two watchers compete for the same queue; they are not independent subscribers.</p>
+      </div>
+      <div class="two-columns">
+        <div><h3>What an event contains</h3><dl class="definition-list"><div><dt>Identity &amp; time</dt><dd>Sequence number, UTC timestamp, PID if WFP supplies it.</dd></div><div><dt>Endpoint</dt><dd>Direction, protocol, local/remote IPv4 and ports in a fixed-size structure.</dd></div><div><dt>Callout action</dt><dd>CONTINUE, BLOCK, or NO-RIGHT. No payload bytes or process path.</dd></div></dl></div>
+        <div><h3>What the counters actually mean</h3><dl class="definition-list"><div><dt>Observed</dt><dd>Authorization callbacks seen, not a packet count or unique-connection count.</dd></div><div><dt>Blocked</dt><dd>Block decisions made by this callout, not measured dropped bytes.</dd></div><div><dt>Queued / Overwritten</dt><dd>Current buffered records / old records lost to capacity pressure.</dd></div></dl></div>
+      </div>
+    </section>
+
+    <section class="writeup wrap" id="security" aria-labelledby="security-title">
+      <p class="eyebrow">06 / Permissions and trust</p><h2 id="security-title">Privilege is not input validation.</h2>
+      <div class="cards three-columns">
+        <article><span class="number">01 / OPEN</span><h3>Restricted device access</h3><p>A protected DACL grants device access only to LocalSystem and elevated Builtin Administrators. <code>FILE_DEVICE_SECURE_OPEN</code> applies security to the device namespace; trailing file names are rejected.</p></article>
+        <article><span class="number">02 / REQUEST</span><h3>Read and write are separate</h3><p>Rule changes require write access on the handle. Stats and events require read access. The controller runs <code>asInvoker</code>; it does not silently elevate or install a service.</p></article>
+        <article><span class="number">03 / VALIDATE</span><h3>Trust the contract, not the caller</h3><p><code>METHOD_BUFFERED</code> supplies a captured system buffer. The driver checks lengths, ABI version, rule fields and reserved values, then returns only initialized bytes.</p></article>
+      </div>
+      <div class="security-contract panel"><span class="number">DEVICE DACL</span><code>D:P(A;;GA;;;SY)(A;;GA;;;BA)</code><p><strong>D:P</strong> — protected discretionary ACL. <strong>SY</strong> — LocalSystem. <strong>BA</strong> — Builtin Administrators. The two allow entries grant generic-all access; an unelevated administrator token does not gain that grant.</p></div>
+      <p class="prose">No payload capture does not mean no sensitive data: IPs, ports, PIDs and timestamps can reveal activity. Test only on authorized systems, keep logs inside the lab, and redact them before publishing. An administrator-only sample is not a tamper-resistant security product.</p>
+    </section>
+
+    <section class="writeup wrap" id="tradeoffs" aria-labelledby="tradeoffs-title">
+      <p class="eyebrow">07 / Design choices</p><h2 id="tradeoffs-title">Small enough to reason about.</h2>
+      <div class="table-scroll" role="region" aria-labelledby="tradeoffs-title" tabindex="0">
+        <table><caption>Intentional choices and the capability each one gives up</caption><thead><tr><th scope="col">Choice</th><th scope="col">Why it is here</th><th scope="col">Tradeoff</th></tr></thead><tbody>
+          <tr><th scope="row">ALE rather than raw packet layers</th><td>Typed endpoints and connection-level policy without parsing network buffers.</td><td>No per-packet inspection, payload capture, or byte counters.</td></tr>
+          <tr><th scope="row">One volatile rule</th><td>Atomic replacement and a simple matching contract; monitor-only after reload.</td><td>No ordered rule list, persistence, CIDR matching or DNS resolution.</td></tr>
+          <tr><th scope="row">One lock, bounded storage</th><td>Rule, counters and ring remain consistent without allocation in classify.</td><td>Shared-lock contention and intentional event loss under load; performance unmeasured.</td></tr>
+          <tr><th scope="row">Dynamic WFP session</th><td>Policy is tied to an engine handle, with transactional startup.</td><td>No automatic recovery after BFE session loss; restart is required.</td></tr>
+          <tr><th scope="row">CONTINUE on nonmatches</th><td>Cooperate with other WFP providers instead of broadly permitting traffic.</td><td>The event alone cannot tell whether the application ultimately connected.</td></tr>
+        </tbody></table>
+      </div>
+    </section>
+
+    <section class="writeup wrap" id="validation" aria-labelledby="validation-title">
+      <p class="eyebrow">08 / Evidence, not assumptions</p><h2 id="validation-title">Built and unit-checked.<br>Not yet kernel-validated.</h2>
+      <p class="prose">The repository records the following local development results with Visual Studio 2026 and WDK 10.0.28000.0. These are a documented validation snapshot, <strong>not a live CI badge</strong> and not evidence of successful filtering in a VM.</p>
+      <div class="validation-grid">
+        <article class="validation-card"><span class="badge passed">LOCAL / PASSED</span><strong>2</strong><h3>x64 configurations</h3><p>Debug and Release solution builds, including WDK INF/catalog checks.</p></article>
+        <article class="validation-card"><span class="badge passed">LOCAL / PASSED</span><strong>45</strong><h3>C checks per configuration</h3><p>Shared rule validation, matching, ABI sizes and IOCTL access bits.</p></article>
+        <article class="validation-card"><span class="badge passed">LOCAL / PASSED</span><strong>13</strong><h3>CLI validation cases</h3><p>Help and invalid-input exit codes, without opening the driver.</p></article>
+        <article class="validation-card"><span class="badge passed">LOCAL / PASSED</span><strong>TCP + UDP</strong><h3>Loopback fixture</h3><p>C echo listener/probe pairs without the driver loaded. Not a filtering test.</p></article>
+      </div>
+      <div class="callout warning"><span class="callout-label">VM / not performed</span><p>Driver loading, live blocking, device ACL enforcement, concurrent kernel operation, unload/reload, BFE lifecycle and Driver Verifier still require an isolated VM. ARM64 configurations exist but have not been built or runtime-tested in the recorded validation.</p></div>
+      <p><a href="https://github.com/hichauhan-in/windows-packet-filter-driver/blob/main/NetworkDriver/docs/TESTING.md">Read the full validation matrix and recovery procedure <span aria-hidden="true">↗</span></a></p>
+    </section>
+
+    <section class="workspace" id="run" aria-labelledby="run-title">
+      <div class="wrap">
+        <p class="eyebrow">09 / Reproduce the work</p><h2 id="run-title">Build locally. Load only in a lab.</h2>
+        <div class="two-columns run-grid">
+          <div><h3>1. Build the native projects</h3><p>Install Visual Studio 2026 with MSVC v145, a compatible Windows SDK/WDK and WDK integration. Open <code>NetworkDriver/NetworkDriver.slnx</code>, or use the 64-bit MSBuild host from a VS Developer Command Prompt.</p><div class="code-panel"><div class="code-head"><span>Developer Command Prompt</span><span>repository root</span></div><pre tabindex="0" aria-label="Build and run the C checks"><code>cd NetworkDriver
+"%VSINSTALLDIR%MSBuild\Current\Bin\amd64\MSBuild.exe" NetworkDriver.slnx /m /p:Configuration=Release /p:Platform=x64
+bin\x64\Release\NetworkDriverTests.exe</code></pre></div><p class="muted">The default tests run without a driver. Build outputs are unsigned by default. No certificate, service or boot setting is changed automatically.</p></div>
+          <div><h3>2. Prepare the isolated VM</h3><p>Use a disposable Windows VM with a snapshot, console access and an authorized private test network. Follow the full guide for test signing, certificate trust and the explicit demand-start service setup.</p><ul class="check-list"><li>Use binaries matching the VM architecture.</li><li>Keep BFE and Windows Firewall enabled.</li><li>Use only narrow loopback or private-lab rules.</li><li>Do not change the development host’s boot or security settings.</li></ul><a class="button secondary" href="https://github.com/hichauhan-in/windows-packet-filter-driver/blob/main/NetworkDriver/docs/TESTING.md">Open the VM setup &amp; rollback guide <span aria-hidden="true">↗</span></a></div>
+        </div>
+        <div class="demo-panel panel"><div><span class="number">3 / MONITOR → BLOCK → RECOVER</span><h3>A deliberate lab sequence</h3><p>Once the signed driver is running, use an elevated VM terminal. Start the C echo listener and a fresh probe for each trial; verify a matching BLOCK event rather than treating a timeout alone as evidence.</p><p class="note">The controller commands below are instructions, not recorded output. For a UDP trial, change both the fixture and the rule protocol.</p></div><div class="code-panel"><div class="code-head"><span>Elevated VM terminal</span><span>driver already loaded</span></div><pre tabindex="0" aria-label="Controller commands for an isolated VM"><code>NetworkCtl monitor
+NetworkCtl block out tcp 127.0.0.1 8080
+NetworkCtl events
+NetworkCtl stats
+NetworkCtl monitor</code></pre></div></div>
+        <p class="muted">Finish by closing watchers and device handles, stopping the driver and removing the lab service. The guide covers rollback and certificate cleanup. Do not force-unload a driver.</p>
+      </div>
+    </section>
+
+    <section class="writeup wrap" id="limits" aria-labelledby="limits-title">
+      <p class="eyebrow">10 / Scope and next steps</p><h2 id="limits-title">Know what this does not prove.</h2>
+      <div class="two-columns"><div><h3>Intentionally outside this version</h3><ul class="plain-list"><li>IPv6, ICMP, Ethernet inspection and raw packet capture.</li><li>Payload inspection, injection or TLS decryption.</li><li>Process-path policy, DNS/CIDR rules or persistent configuration.</li><li>Automatic BFE recovery and per-client event subscriptions.</li><li>Production readiness, tamper resistance or measured throughput claims.</li></ul></div><div><h3>The next useful engineering work</h3><ol class="plain-list"><li>Run and record the isolated-VM matrix, including negative and recovery paths.</li><li>Exercise unload and concurrency with a debugger and targeted Driver Verifier.</li><li>Only then extend scope: IPv6 layers, richer policy, or BFE-state handling.</li><li>Measure callback cost and lock contention before making performance claims.</li></ol></div></div>
+      <p class="closing-note">The lesson is not just how to return BLOCK. It is how to make a bounded, explainable decision without breaking the operating system’s ownership, lifetime, or permission rules.</p>
+    </section>
+
+    <section class="writeup wrap source-section" id="source-map" aria-labelledby="source-title">
+      <p class="eyebrow">11 / Read the implementation</p><h2 id="source-title">A short path from design to source.</h2>
+      <div class="source-grid">
+        <a class="source-card" href="https://github.com/hichauhan-in/windows-packet-filter-driver/blob/main/NetworkDriver/NetworkDriver.c"><span class="number">DRIVER</span><h3>NetworkDriver.c <span aria-hidden="true">↗</span></h3><p>Entry, secure device, IOCTL dispatch, WFP registration, classify and cleanup.</p></a>
+        <a class="source-card" href="https://github.com/hichauhan-in/windows-packet-filter-driver/blob/main/NetworkDriver/Shared/NetworkDriverShared.h"><span class="number">ABI</span><h3>NetworkDriverShared.h <span aria-hidden="true">↗</span></h3><p>Fixed-width structures, access-specific IOCTLs, versions and compile-time sizes.</p></a>
+        <a class="source-card" href="https://github.com/hichauhan-in/windows-packet-filter-driver/blob/main/NetworkDriver/Shared/NetworkRule.h"><span class="number">POLICY</span><h3>NetworkRule.h <span aria-hidden="true">↗</span></h3><p>Small, testable validation and matching functions shared with the C tests.</p></a>
+        <a class="source-card" href="https://github.com/hichauhan-in/windows-packet-filter-driver/blob/main/NetworkDriver/NetworkCtl/NetworkCtl.c"><span class="number">CONTROLLER</span><h3>NetworkCtl.c <span aria-hidden="true">↗</span></h3><p>Strict CLI parsing, least-access handles, UTC metadata and watch mode.</p></a>
+        <a class="source-card" href="https://github.com/hichauhan-in/windows-packet-filter-driver/blob/main/NetworkDriver/Tests/NetworkDriverTests.c"><span class="number">TESTS</span><h3>NetworkDriverTests.c <span aria-hidden="true">↗</span></h3><p>Rule/ABI checks, opt-in device checks, and bounded TCP/UDP echo fixtures.</p></a>
+        <a class="source-card" href="https://github.com/hichauhan-in/windows-packet-filter-driver/blob/main/NetworkDriver/README.md"><span class="number">REFERENCE</span><h3>Native project guide <span aria-hidden="true">↗</span></h3><p>The full command contract, build requirements, permission model and limitations.</p></a>
+      </div>
+    </section>
+  </main>
+  <footer class="site-footer wrap">
+    <div><a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">[pf]</span> packet<span class="brand-suffix"> / WINDOWS</span></a><p>A systems-programming project by Himanshu.<br>Static explanation. No live capture, analytics, or connection to a driver.</p></div>
+    <nav aria-label="Footer navigation"><a href="https://github.com/hichauhan-in/windows-packet-filter-driver">Repository <span aria-hidden="true">↗</span></a><a href="https://hichauhan-in.github.io/heapmanager-windows/">Explore the heap manager <span aria-hidden="true">↗</span></a><a href="#main">Back to top ↑</a></nav>
+  </footer>
+</body>
+</html>

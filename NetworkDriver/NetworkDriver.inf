@@ -1,0 +1,49 @@
+; Primitive, non-PnP WFP lab driver. Install only in an authorized test VM.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+DriverVer=01/01/2025,1.0.0.0
+CatalogFile=NetworkDriver.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DriverCopy = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+NetworkDriver.sys=1
+
+[DefaultInstall.NTamd64]
+CopyFiles=DriverCopy
+
+[DefaultInstall.NTamd64.Services]
+AddService=NetworkDriver,0x00000002,DriverService
+
+[DefaultInstall.NTarm64]
+CopyFiles=DriverCopy
+
+[DefaultInstall.NTarm64.Services]
+AddService=NetworkDriver,0x00000002,DriverService
+
+[DriverCopy]
+NetworkDriver.sys
+
+[DriverService]
+DisplayName=%ServiceName%
+Description=%ServiceDescription%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\NetworkDriver.sys
+Dependencies=BFE
+
+[Strings]
+ManufacturerName="Himanshu - Driver Learning Projects"
+DiskName="NetworkDriver Installation Media"
+ServiceName="NetworkDriver WFP Lab"
+ServiceDescription="Demand-start IPv4 TCP/UDP authorization monitoring and filtering lab"

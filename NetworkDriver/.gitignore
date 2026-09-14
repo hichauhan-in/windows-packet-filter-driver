@@ -1,0 +1,16 @@
+.vs/
+bin/
+obj/
+x64/
+ARM64/
+Debug/
+Release/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.pfx
+*.p12
+*.cer
+*.pvk
+*.snk
